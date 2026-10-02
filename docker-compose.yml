@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: vma_db
+    environment:
+      POSTGRES_USER: vma
+      POSTGRES_PASSWORD: vma_password
+      POSTGRES_DB: vma_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - vma_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vma -d vma_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: ./backend
+    container_name: vma_api
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount local code into container for hot-reloading during development
+      - ./backend:/app
+    # Override CMD to add --reload for development
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  vma_pgdata:

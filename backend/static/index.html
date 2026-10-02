@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VMA Voice Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 24px;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+
+    h1 {
+      margin-bottom: 8px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      margin: 16px 0;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: #2563eb;
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 12px 18px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.secondary {
+      background: #475569;
+    }
+
+    .panel {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
+    }
+
+    #log {
+      height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      background: #020617;
+      border-radius: 8px;
+      padding: 12px;
+      border: 1px solid #1f2937;
+    }
+
+    .muted {
+      color: #94a3b8;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid #1f2937;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: #93c5fd;
+    }
+
+    .status {
+      padding: 8px 10px;
+      border-radius: 8px;
+      display: inline-block;
+      background: #1e293b;
+      margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>VMA Voice Demo</h1>
+  <div class="muted">
+    Browser microphone replaces Twilio for Phase 1 testing.
+    Audio is streamed to Gemini 3.8 Live through FastAPI.
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start Call</button>
+    <button id="stopBtn" class="secondary" disabled>Stop Call</button>
+    <button id="refreshBtn" class="secondary">Refresh Messages</button>
+  </div>
+
+  <div class="status" id="status">Idle</div>
+
+  <div class="panel">
+    <h3>Events</h3>
+    <div id="log"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Saved Messages</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Type</th>
+          <th>Name</th>
+          <th>DOB</th>
+          <th>Callback</th>
+          <th>Reason</th>
+          <th>Status</th>
+          <th>Confirmed</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody id="messagesBody">
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const messagesBody = document.getElementById("messagesBody");
+
+    const API_BASE = window.location.origin && window.location.origin.startsWith("http")
+      ? window.location.origin
+      : "http://localhost:8000";
+
+    const WS_URL = (window.location.protocol === "https:" ? "wss://" : "ws://") +
+      (window.location.host ? window.location.host : "localhost:8000") +
+      "/ws/voice";
+
+    let ws = null;
+    let mediaStream = null;
+    let audioContext = null;
+    let sourceNode = null;
+    let workletNode = null;
+    let audioStarted = false;
+
+    let playbackContext = null;
+    let nextStartTime = 0;
+    let activeSources = [];
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function log(text) {
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent += `[${ts}] ${text}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function base64ToArrayBuffer(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      let binary = "";
+      const bytes = new Uint8Array(buffer);
+      const chunkSize = 0x8000;
+
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, chunk);
+      }
+
+      return btoa(binary);
+    }
+
+    function floatTo16BitPCM(float32Array) {
+      const buffer = new ArrayBuffer(float32Array.length * 2);
+      const view = new DataView(buffer);
+
+      for (let i = 0; i < float32Array.length; i++) {
+        let sample = Math.max(-1, Math.min(1, float32Array[i]));
+        const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        view.setInt16(i * 2, int16, true);
+      }
+
+      return buffer;
+    }
+
+    function downsampleBuffer(buffer, inputRate, outputRate) {
+      if (inputRate === outputRate) {
+        return buffer;
+      }
+
+      const ratio = inputRate / outputRate;
+      const newLength = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLength);
+
+      for (let i = 0; i < newLength; i++) {
+        const start = Math.round(i * ratio);
+        const end = Math.round((i + 1) * ratio);
+
+        let sum = 0;
+        let count = 0;
+
+        for (let j = start; j < end && j < buffer.length; j++) {
+          sum += buffer[j];
+          count++;
+        }
+
+        result[i] = sum / Math.max(1, count);
+      }
+
+      return result;
+    }
+
+    const workletCode = `
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (input && input.length > 0) {
+            this.port.postMessage(input[0], [input[0]]);
+          }
+          return true;
+        }
+      }
+
+      registerProcessor("pcm-processor", PCMProcessor);
+    `;
+
+    async function initAudioPipeline() {
+      if (audioStarted) return;
+      audioStarted = true;
+
+      try {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 16000
+        });
+      } catch (e) {
+        log("Browser did not allow 16kHz AudioContext. Using default and downsampling.");
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
+      const workletBlob = new Blob([workletCode], {
+        type: "application/javascript"
+      });
+      const workletUrl = URL.createObjectURL(workletBlob);
+
+      await audioContext.audioWorklet.addModule(workletUrl);
+
+      sourceNode = audioContext.createMediaStreamSource(mediaStream);
+      workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
+
+      workletNode.port.onmessage = (event) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const float32 = event.data;
+        const downsampled = downsampleBuffer(
+          float32,
+          audioContext.sampleRate,
+          16000
+        );
+
+        const pcm16 = floatTo16BitPCM(downsampled);
+        const payload = arrayBufferToBase64(pcm16);
+
+        ws.send(JSON.stringify({
+          type: "audio_in",
+          payload
+        }));
+      };
+
+      sourceNode.connect(workletNode);
+
+      // Important:
+      // Do not connect workletNode to destination.
+      // That would create mic feedback.
+
+      log("Audio pipeline started.");
+    }
+
+    function base64ToInt16Array(base64) {
+      const buffer = base64ToArrayBuffer(base64);
+      const view = new DataView(buffer);
+      const int16 = new Int16Array(buffer.byteLength / 2);
+
+      for (let i = 0; i < int16.length; i++) {
+        int16[i] = view.getInt16(i * 2, true);
+      }
+
+      return int16;
+    }
+
+    function ensurePlaybackContext() {
+      if (!playbackContext) {
+        playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+
+      if (playbackContext.state === "suspended") {
+        playbackContext.resume();
+      }
+    }
+
+    function clearPlayback() {
+      for (const source of activeSources) {
+        try {
+          source.stop();
+        } catch (e) {
+          // Ignore.
+        }
+      }
+
+      activeSources = [];
+      nextStartTime = 0;
+    }
+
+    function enqueueAudio(base64Payload) {
+      ensurePlaybackContext();
+
+      const int16 = base64ToInt16Array(base64Payload);
+      const float32 = new Float32Array(int16.length);
+
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768;
+      }
+
+      const audioBuffer = playbackContext.createBuffer(
+        1,
+        float32.length,
+        24000
+      );
+
+      audioBuffer.copyToChannel(float32, 0);
+
+      const source = playbackContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(playbackContext.destination);
+
+      const now = playbackContext.currentTime;
+
+      if (nextStartTime < now) {
+        nextStartTime = now + 0.05;
+      }
+
+      source.start(nextStartTime);
+      nextStartTime += audioBuffer.duration;
+
+      activeSources.push(source);
+
+      source.onended = () => {
+        const idx = activeSources.indexOf(source);
+        if (idx >= 0) {
+          activeSources.splice(idx, 1);
+        }
+      };
+    }
+
+    async function refreshMessages() {
+      try {
+        const response = await fetch(`${API_BASE}/messages?practice_id=1&limit=50`);
+        const messages = await response.json();
+
+        messagesBody.innerHTML = "";
+
+        for (const message of messages) {
+          const row = document.createElement("tr");
+
+          row.innerHTML = `
+            <td>${message.id}</td>
+            <td>${message.message_type}</td>
+            <td>${message.caller_name || ""}</td>
+            <td>${message.dob || ""}</td>
+            <td>${message.callback_number || ""}</td>
+            <td>${message.reason || ""}</td>
+            <td>${message.status}</td>
+            <td>${message.confirmed}</td>
+            <td>${new Date(message.created_at).toLocaleString()}</td>
+          `;
+
+          messagesBody.appendChild(row);
+        }
+      } catch (e) {
+        log(`Failed to load messages: ${e.message}`);
+      }
+    }
+
+    function handleServerMessage(event) {
+      let msg;
+
+      try {
+        msg = JSON.parse(event.data);
+      } catch (e) {
+        log("Invalid server message.");
+        return;
+      }
+
+      if (msg.type === "status") {
+        setStatus(msg.message);
+        log(`status: ${msg.message}`);
+      }
+
+      else if (msg.type === "ready") {
+        setStatus("Ready. Speak naturally.");
+        log(`ready: practice=${msg.practice_name} model=${msg.model}`);
+        initAudioPipeline();
+      }
+
+      else if (msg.type === "audio_out") {
+        enqueueAudio(msg.payload);
+      }
+
+      else if (msg.type === "interrupted") {
+        clearPlayback();
+        log("interrupted: clearing playback buffer");
+      }
+
+      else if (msg.type === "turn_complete") {
+        log("turn_complete");
+      }
+
+      else if (msg.type === "transcript") {
+        log(`${msg.role}: ${msg.text}`);
+      }
+
+      else if (msg.type === "tool_call") {
+        log(`tool_call: ${msg.name} ${JSON.stringify(msg.args || {})}`);
+      }
+
+      else if (msg.type === "tool_result") {
+        log(`tool_result: ${msg.name} ${JSON.stringify(msg.result || {})}`);
+
+        if (
+          msg.name === "take_message" ||
+          msg.name === "request_callback" ||
+          msg.name === "escalate_to_human"
+        ) {
+          refreshMessages();
+        }
+      }
+
+      else if (msg.type === "escalation") {
+        log(`ESCALATION: ${msg.reason}`);
+        setStatus(`Escalation: ${msg.reason}`);
+      }
+
+      else if (msg.type === "event") {
+        log(`event: ${msg.event}`);
+        refreshMessages();
+      }
+
+      else if (msg.type === "error") {
+        log(`ERROR: ${msg.message} ${msg.detail || ""}`);
+        setStatus(`Error: ${msg.message}`);
+      }
+
+      else {
+        log(`unknown event: ${msg.type}`);
+      }
+    }
+
+    async function startCall() {
+      try {
+        log("Requesting microphone permission...");
+
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+        log("Microphone acquired.");
+
+        ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => {
+          log("WebSocket connected.");
+          ws.send(JSON.stringify({
+            type: "start",
+            practice_id: 1
+          }));
+        };
+
+        ws.onmessage = handleServerMessage;
+
+        ws.onerror = () => {
+          log("WebSocket error.");
+          setStatus("WebSocket error.");
+        };
+
+        ws.onclose = (event) => {
+          log(`WebSocket closed: ${event.code}`);
+          setStatus("Call ended.");
+          cleanup();
+        };
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+
+      } catch (e) {
+        log(`Failed to start call: ${e.message}`);
+        setStatus("Failed to start call.");
+      }
+    }
+
+    function cleanup() {
+      audioStarted = false;
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      if (sourceNode) {
+        try {
+          sourceNode.disconnect();
+        } catch (e) {}
+        sourceNode = null;
+      }
+
+      if (workletNode) {
+        try {
+          workletNode.disconnect();
+        } catch (e) {}
+        workletNode = null;
+      }
+
+      if (audioContext) {
+        try {
+          audioContext.close();
+        } catch (e) {}
+        audioContext = null;
+      }
+
+      clearPlayback();
+
+      if (playbackContext) {
+        try {
+          playbackContext.close();
+        } catch (e) {}
+        playbackContext = null;
+      }
+
+      if (ws) {
+        try {
+          ws.close();
+        } catch (e) {}
+        ws = null;
+      }
+
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    function stopCall() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "stop" }));
+      }
+
+      cleanup();
+      setStatus("Call stopped.");
+      log("Call stopped by user.");
+    }
+
+    startBtn.addEventListener("click", startCall);
+    stopBtn.addEventListener("click", stopCall);
+    refreshBtn.addEventListener("click", refreshMessages);
+
+    refreshMessages();
+  </script>
+</body>
+</html>
