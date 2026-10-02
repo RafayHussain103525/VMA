@@ -17,14 +17,10 @@ from app.services import (
 )
 from app.voice import VoiceBridge
 
-
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     yield
-
 
 app = FastAPI(
     title="VMA AI Phase 1",
@@ -32,15 +28,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
+# FIX 1: CORS Configuration
+# Browsers block allow_origins=["*"] when allow_credentials=True.
+# We set allow_credentials=False to allow the wildcard origin for local development.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 @app.get("/health")
 async def health() -> dict[str, str]:
@@ -49,7 +46,6 @@ async def health() -> dict[str, str]:
         "environment": settings.environment,
         "model": settings.gemini_model,
     }
-
 
 @app.get("/messages", response_model=list[MessageOut])
 async def get_messages(
@@ -63,7 +59,6 @@ async def get_messages(
     )
     return [MessageOut.model_validate(message) for message in messages]
 
-
 @app.get("/calls", response_model=list[CallOut])
 async def get_calls(
     practice_id: int = Query(default=1),
@@ -75,7 +70,6 @@ async def get_calls(
         limit=limit,
     )
     return [CallOut.model_validate(call) for call in calls]
-
 
 @app.post("/messages", response_model=MessageOut, status_code=201)
 async def create_message(body: MessageCreate) -> MessageOut:
@@ -106,7 +100,6 @@ async def create_message(body: MessageCreate) -> MessageOut:
 
     return MessageOut.model_validate(message)
 
-
 @app.websocket("/ws/voice")
 async def websocket_voice(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -114,7 +107,6 @@ async def websocket_voice(websocket: WebSocket) -> None:
     bridge = VoiceBridge(websocket=websocket)
 
     await bridge.run()
-
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 if STATIC_DIR.exists():

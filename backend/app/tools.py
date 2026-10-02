@@ -43,6 +43,7 @@ async def get_accepted_insurance() -> list[str]:
         practice = await get_practice(session, settings.default_practice_id)
     return practice.accepted_insurance if practice else []
 
+# FIX 3: Removed default values from function signatures to prevent Google AI schema warnings
 async def take_message(
     caller_name: str, 
     dob: str, 
@@ -57,23 +58,22 @@ async def take_message(
     if not dob or dob.lower() in {"refused", "unknown", "n/a"}:
         return {"status": "error", "error": "missing_dob"}
         
-    # Handle empty or 'none' callback numbers since we removed the default
     if not callback_number or callback_number.lower() in {"none", "null", "n/a", ""}:
         callback_number = None
         
-    async with SessionLocal() as session:
-        msg = await save_message(
-            session,
-            practice_id=settings.default_practice_id,
-            call_id=call_id,
-            caller_name=caller_name,
-            dob=dob,
-            reason=reason,
-            callback_number=callback_number,
-            message_type="message",
-            confirmed=True
-        )
-        await update_call_intent(session, call_id, "message")
+    # FIX 4: Pass SessionLocal (the factory) instead of an instantiated session
+    msg = await save_message(
+        SessionLocal,
+        practice_id=settings.default_practice_id,
+        call_id=call_id,
+        caller_name=caller_name,
+        dob=dob,
+        reason=reason,
+        callback_number=callback_number,
+        message_type="message",
+        confirmed=True
+    )
+    await update_call_intent(SessionLocal, call_id, "message")
         
     return {"status": "success", "message_id": msg.id}
 
@@ -91,31 +91,31 @@ async def request_callback(
     if not dob or dob.lower() in {"refused", "unknown", "n/a"}:
         return {"status": "error", "error": "missing_dob"}
         
-    # Handle empty or 'none' callback numbers since we removed the default
     if not callback_number or callback_number.lower() in {"none", "null", "n/a", ""}:
         callback_number = None
         
-    async with SessionLocal() as session:
-        msg = await save_message(
-            session,
-            practice_id=settings.default_practice_id,
-            call_id=call_id,
-            caller_name=caller_name,
-            dob=dob,
-            reason=reason,
-            callback_number=callback_number,
-            message_type="callback",
-            confirmed=True
-        )
-        await update_call_intent(session, call_id, "callback")
+    # FIX 4: Pass SessionLocal (the factory) instead of an instantiated session
+    msg = await save_message(
+        SessionLocal,
+        practice_id=settings.default_practice_id,
+        call_id=call_id,
+        caller_name=caller_name,
+        dob=dob,
+        reason=reason,
+        callback_number=callback_number,
+        message_type="callback",
+        confirmed=True
+    )
+    await update_call_intent(SessionLocal, call_id, "callback")
         
     return {"status": "success", "message_id": msg.id}
 
 async def escalate_to_human(reason: str) -> dict:
     """Escalate to a human VMA. Use this for emergencies, caller requests for a person, frustration, unclear requests, refused identity details, or anything you cannot safely resolve."""
     call_id = current_call_id.get()
-    async with SessionLocal() as session:
-        await mark_call_escalated(session, call_id)
+    
+    # FIX 4: Pass SessionLocal (the factory) instead of an instantiated session
+    await mark_call_escalated(SessionLocal, call_id)
         
     return {"status": "handoff_required", "reason": reason}
 
