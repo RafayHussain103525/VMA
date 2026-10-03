@@ -37,6 +37,8 @@ class Practice(Base):
     new_patient_info: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     escalation_phone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     ehr_type: Mapped[str] = mapped_column(String(32), default="none")
+    doctor_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    medical_specialty: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

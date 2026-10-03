@@ -21,6 +21,9 @@ DEFAULT_PRACTICE_SEED = {
     "new_patient_info": "We are accepting new patients.",
     "escalation_phone": "+15552223333",
     "ehr_type": "none",
+    "doctor_name": "Dr. John Doe",
+    "medical_specialty": "General Practice",
+    "created_at": datetime.now(timezone.utc),
 }
 
 

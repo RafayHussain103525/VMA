@@ -43,6 +43,18 @@ async def get_accepted_insurance() -> list[str]:
         practice = await get_practice(session, settings.default_practice_id)
     return practice.accepted_insurance if practice else []
 
+async def get_doctor_name() -> str:
+    """Get the name of the primary doctor at the practice."""
+    async with SessionLocal() as session:
+        practice = await get_practice(session, settings.default_practice_id)
+    return practice.doctor_name if practice else "Doctor not available."
+
+async def get_medical_specialty() -> str:
+    """Get the medical specialty of the practice."""
+    async with SessionLocal() as session:
+        practice = await get_practice(session, settings.default_practice_id)
+    return practice.medical_specialty if practice else "Specialty not available."
+
 # FIX 3: Removed default values from function signatures to prevent Google AI schema warnings
 async def take_message(
     caller_name: str, 
@@ -126,13 +138,17 @@ ALL_TOOLS = [
     get_accepted_insurance,
     take_message,
     request_callback,
-    escalate_to_human
+    escalate_to_human,
+    get_doctor_name,
+    get_medical_specialty,
 ]
 
 SYSTEM_INSTRUCTION = """
 You are a Virtual Medical Assistant for Sunrise Medical.
 Your tone must be warm, professional, calm, and clear. Do not sound robotic. Speak naturally.
 Your job is to answer patient calls and help with routine practice requests.
+
+CRITICAL VOICE LOCK: You must maintain the exact same voice persona, pitch, and tone throughout the entire call. Do not change your voice, adopt accents, or roleplay as different characters under any circumstances.And you only talk in english even if the caller speaks in another language.
 
 CRITICAL FIRST STEP: As soon as the connection starts, you must speak first. Do not wait for the user. 
 Greet the caller immediately by saying: "Thank you for calling Sunrise Medical. How may I help you today?"

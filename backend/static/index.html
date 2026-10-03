@@ -186,7 +186,7 @@
             registerProcessor("pcm-processor", PCMProcessor);
         `;
 
-        async function initAudioPipeline() {
+                        async function initAudioPipeline() {
             if (audioStarted) return;
             audioStarted = true;
 
@@ -216,10 +216,34 @@
             sourceNode = audioContext.createMediaStreamSource(mediaStream);
             workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
 
+            // 🔥 TWEAK THESE TWO NUMBERS TO FIX THE SENSITIVITY
+            const START_SPEECH_THRESHOLD = 0.06; // Increase this if breathing interrupts the AI
+            const STOP_SPEECH_THRESHOLD = 0.02;  // Must be lower than START to prevent flickering
+
+            let isSpeaking = false;
+
             workletNode.port.onmessage = (event) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
                 const float32 = event.data;
+                
+                // Calculate Root Mean Square (RMS) volume
+                let sum = 0;
+                for (let i = 0; i < float32.length; i++) {
+                    sum += float32[i] * float32[i];
+                }
+                const rms = Math.sqrt(sum / float32.length);
+
+                // Barge-In Logic with Hysteresis
+                if (rms > START_SPEECH_THRESHOLD && !isSpeaking) {
+                    console.log(`[VAD] User started speaking (RMS: ${rms.toFixed(3)}). Triggering Barge-In!`);
+                    isSpeaking = true;
+                    clearPlayback(); // Instantly stops the AI from speaking
+                } 
+                else if (rms < STOP_SPEECH_THRESHOLD && isSpeaking) {
+                    isSpeaking = false; // User stopped speaking
+                }
+
                 const downsampled = downsampleBuffer(float32, audioContext.sampleRate, 16000);
                 const pcm16 = floatTo16BitPCM(downsampled);
                 const payload = arrayBufferToBase64(pcm16);
@@ -231,7 +255,6 @@
             };
 
             sourceNode.connect(workletNode);
-            // Note: DO NOT connect workletNode to destination to avoid mic feedback!
             log("Audio pipeline started.");
         }
 

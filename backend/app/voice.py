@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import uuid
-import sys
 
 from fastapi import WebSocket, WebSocketDisconnect
 from google import genai
@@ -16,33 +15,17 @@ from app.services import (
 from app.db import SessionLocal
 from app.config import settings
 
-# Initialize GenAI Client
 client = genai.Client(api_key=settings.google_api_key)
 
-# Define Tools manually for the Raw Live API
 TOOL_DECLARATIONS = [
     types.Tool(
         function_declarations=[
-            types.FunctionDeclaration(
-                name="get_practice_info",
-                description="Get general practice information.",
-                parameters=types.Schema(type=types.Type.OBJECT, properties={})
-            ),
-            types.FunctionDeclaration(
-                name="get_office_hours",
-                description="Get the practice office hours.",
-                parameters=types.Schema(type=types.Type.OBJECT, properties={})
-            ),
-            types.FunctionDeclaration(
-                name="get_location",
-                description="Get the practice address.",
-                parameters=types.Schema(type=types.Type.OBJECT, properties={})
-            ),
-            types.FunctionDeclaration(
-                name="get_accepted_insurance",
-                description="Get accepted insurance.",
-                parameters=types.Schema(type=types.Type.OBJECT, properties={})
-            ),
+            types.FunctionDeclaration(name="get_practice_info", description="Get general practice info.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
+            types.FunctionDeclaration(name="get_office_hours", description="Get office hours.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
+            types.FunctionDeclaration(name="get_location", description="Get address.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
+            types.FunctionDeclaration(name="get_accepted_insurance", description="Get insurance.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
+            types.FunctionDeclaration(name="get_doctor_name", description="Get doctor name.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
+            types.FunctionDeclaration(name="get_medical_specialty", description="Get medical specialty.", parameters=types.Schema(type=types.Type.OBJECT, properties={})),
             types.FunctionDeclaration(
                 name="take_message",
                 description="Save a message. Only call after explicit confirmation.",
@@ -76,13 +59,7 @@ TOOL_DECLARATIONS = [
             types.FunctionDeclaration(
                 name="escalate_to_human",
                 description="Escalate to a human.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "reason": types.Schema(type=types.Type.STRING)
-                    },
-                    required=["reason"]
-                )
+                parameters=types.Schema(type=types.Type.OBJECT, properties={"reason": types.Schema(type=types.Type.STRING)}, required=["reason"])
             )
         ]
     )
@@ -112,6 +89,15 @@ class VoiceBridge:
                             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
                         )
                     ),
+                    # 🔥 FIX 1: Explicitly enable high-sensitivity VAD for Barge-In
+                    realtime_input_config=types.RealtimeInputConfig(
+                        automatic_activity_detection=types.AutomaticActivityDetection(
+                            disabled=False,
+                            start_of_speech_sensitivity="START_SENSITIVITY_HIGH",
+                            end_of_speech_sensitivity="END_SENSITIVITY_HIGH",
+                            prefix_padding_ms=1000
+                        )
+                    ),
                     input_audio_transcription=types.AudioTranscriptionConfig(),
                     output_audio_transcription=types.AudioTranscriptionConfig()
                 )
@@ -124,14 +110,9 @@ class VoiceBridge:
                     "model": settings.gemini_model
                 })
 
-                # 🔥 FIX 1: TRIGGER GREETING
-                # Send an initial text prompt to force the model to speak first
-                await session.send_client_content(
-                    turns=[types.Content(
-                        role="user",
-                        parts=[types.Part(text="A patient just connected. Please greet them now using the practice name and ask how you may help.")]
-                    )],
-                    turn_complete=True
+                # Trigger greeting
+                await session.send_realtime_input(
+                    text="A patient just connected. Please greet them now using the practice name and ask how you may help."
                 )
 
                 async def upstream():
@@ -157,52 +138,55 @@ class VoiceBridge:
                 async def downstream():
                     try:
                         print("[DOWNSTREAM] Listening for Gemini events...", flush=True)
-                        async for event in session.receive():
-                            if event.tool_call:
-                                function_responses = []
-                                for fc in event.tool_call.function_calls:
-                                    result = await self._execute_tool(fc.name, fc.args)
-                                    function_responses.append(
-                                        types.FunctionResponse(
-                                            name=fc.name,
-                                            response=result
+                        while True:
+                            async for event in session.receive():
+                                if event.tool_call:
+                                    function_responses = []
+                                    for fc in event.tool_call.function_calls:
+                                        print(f"[DOWNSTREAM] Tool call: {fc.name}({fc.args})", flush=True)
+                                        result = await self._execute_tool(fc.name, fc.args)
+                                        
+                                        # Send the dictionary result back to Gemini
+                                        function_responses.append(
+                                            types.FunctionResponse(
+                                                id=fc.id,
+                                                name=fc.name,
+                                                response=result
+                                            )
                                         )
-                                    )
-                                await session.send_tool_response(
-                                    tool_response=types.ToolResponse(
-                                        function_responses=function_responses
-                                    )
-                                )
-                            
-                            if event.server_content:
-                                if event.server_content.model_turn:
-                                    for part in event.server_content.model_turn.parts:
-                                        if part.inline_data and part.inline_data.mime_type.startswith("audio/pcm"):
-                                            payload = base64.b64encode(part.inline_data.data).decode("utf-8")
-                                            await self.ws.send_json({
-                                                "type": "audio_out",
-                                                "payload": payload,
-                                                "sample_rate": 24000
-                                            })
+                                    
+                                    await session.send_tool_response(function_responses=function_responses)
                                 
-                                if event.server_content.input_transcription:
-                                    await self.ws.send_json({
-                                        "type": "transcript",
-                                        "role": "user",
-                                        "text": event.server_content.input_transcription.text
-                                    })
-                                if event.server_content.output_transcription:
-                                    await self.ws.send_json({
-                                        "type": "transcript",
-                                        "role": "assistant",
-                                        "text": event.server_content.output_transcription.text
-                                    })
-
+                                if event.server_content:
+                                    if event.server_content.model_turn:
+                                        for part in event.server_content.model_turn.parts:
+                                            if part.inline_data and part.inline_data.mime_type.startswith("audio/pcm"):
+                                                payload = base64.b64encode(part.inline_data.data).decode("utf-8")
+                                                await self.ws.send_json({
+                                                    "type": "audio_out",
+                                                    "payload": payload,
+                                                    "sample_rate": 24000
+                                                })
+                                    
+                                    if event.server_content.input_transcription:
+                                        await self.ws.send_json({
+                                            "type": "transcript",
+                                            "role": "user",
+                                            "text": event.server_content.input_transcription.text
+                                        })
+                                    if event.server_content.output_transcription:
+                                        await self.ws.send_json({
+                                            "type": "transcript",
+                                            "role": "assistant",
+                                            "text": event.server_content.output_transcription.text
+                                        })
+                                        
+                            print("[DOWNSTREAM] Iterator ended, attempting to re-enter...", flush=True)
+                            await asyncio.sleep(0.5)
+                            
                     except Exception as e:
                         print(f"[DOWNSTREAM ERROR]: {e}", flush=True)
 
-                # 🔥 FIX 2: PREVENT SILENT DEATH
-                # If either upstream or downstream finishes, cancel the other and close the connection.
                 upstream_task = asyncio.create_task(upstream())
                 downstream_task = asyncio.create_task(downstream())
 
@@ -229,22 +213,42 @@ class VoiceBridge:
             async with SessionLocal() as session:
                 practice = await get_practice(session, settings.default_practice_id)
             if not practice: return {"status": "error", "error": "practice_not_found"}
-            return {"status": "success", "practice": {"name": practice.name, "address": practice.address, "office_hours": practice.office_hours, "accepted_insurance": practice.accepted_insurance or [], "new_patient_info": practice.new_patient_info}}
+            return {
+                "status": "success", 
+                "name": practice.name, 
+                "address": practice.address, 
+                "office_hours": practice.office_hours, 
+                "accepted_insurance": practice.accepted_insurance or [], 
+                "new_patient_info": practice.new_patient_info
+            }
         
         elif name == "get_office_hours":
             async with SessionLocal() as session:
                 practice = await get_practice(session, settings.default_practice_id)
-            return practice.office_hours if practice else "Monday through Friday, 9am to 5pm"
+            # 🔥 FIX: Wrap the string in a dictionary
+            return {"office_hours": practice.office_hours if practice else "Monday through Friday, 9am to 5pm"}
             
         elif name == "get_location":
             async with SessionLocal() as session:
                 practice = await get_practice(session, settings.default_practice_id)
-            return practice.address if practice else "Address not available."
+            # 🔥 FIX: Wrap the string in a dictionary
+            return {"address": practice.address if practice else "Address not available."}
             
         elif name == "get_accepted_insurance":
             async with SessionLocal() as session:
                 practice = await get_practice(session, settings.default_practice_id)
-            return practice.accepted_insurance if practice else []
+            # 🔥 FIX: Wrap the list in a dictionary
+            return {"accepted_insurance": practice.accepted_insurance if practice else []}
+        
+        elif name == "get_doctor_name":
+            async with SessionLocal() as session:
+                practice = await get_practice(session, settings.default_practice_id)
+            return {"doctor_name": practice.doctor_name if practice else "Doctor not available."}
+            
+        elif name == "get_medical_specialty":
+            async with SessionLocal() as session:
+                practice = await get_practice(session, settings.default_practice_id)
+            return {"medical_specialty": practice.medical_specialty if practice else "Specialty not available."}
             
         elif name == "take_message":
             call_id = current_call_id.get()
